@@ -1,0 +1,321 @@
+import time
+import os
+import torch
+import random
+
+from matplotlib import pyplot as plt
+from torch.utils.data import DataLoader
+from tensorboardX import SummaryWriter
+from utils.metrics import HausdorffLoss as HD
+from utils.metrics import jaccard as jac
+from utils.metrics import recall as recall
+from utils.metrics import pixel_accuracy as pa
+from utils.metrics import accuracy as acc
+from utils.metrics import se as SE
+from utils.metrics import sp as SP
+from utils.metrics import IOU as iou
+from utils.metrics import compute_mIoU as miou
+from torch.optim import lr_scheduler
+from tqdm import tqdm
+import sys
+# from networks.Attpaspp import AttpasppU_Net
+# from networks.Unet import AttU_Net, R2AttU_Net, R2U_Net
+# from networks.attplusunet import AttpUdeep_Net
+# from networks.attpunetattxin import AttpU_Net
+# from networks.res_unet_plus import ResUnetPlusPlus
+# from networks.mau_net import MAU_Net
+# from networks.Unet import U_Net
+# from networks.DefEDNet import DefED_Net
+# from networks.asfnet import ASFNet
+# from networks.ERSUnet import ERSUnet
+from networks.flashUnet import flashUNet
+from networks.frequencynet import frequencynet
+from networks.UNet import UNet
+from networks.segnet import SegNet
+from networks.NewMyNet import My_Net
+from datasets import bladder
+import utils.image_transforms as joint_transforms
+import utils.transforms as extended_transforms
+from utils.loss import *
+from utils.metrics import diceCoeffv2
+from utils import misc
+from utils.pytorchtools import EarlyStopping
+from utils.LRScheduler import PolyLR
+from utils.canny import edgeextractor
+# 超参设置
+crop_size = 512  # 输入裁剪大小
+batch_size = 4  # batch size
+n_epoch = 200  # 训练的最大epoch
+early_stop__eps = 1e-3  # 早停的指标阈值
+early_stop_patience = 20  # 早停的epoch阈值
+initial_lr = 1e-4  # 初始学习率
+threshold_lr = 1e-6  # 早停的学习率阈值
+weight_decay = 1e-5  # 学习率衰减率
+optimizer_type = 'adam'  # adam, sgd
+scheduler_type = ''  # ReduceLR, StepLR, poly
+label_smoothing = 0.001
+aux_loss = False
+gamma = 0.5
+alpha = 0.85
+model_number = random.randint(1, 1e6)
+
+
+model_type = "flashUNetrforROCinLiTS"
+
+
+root_path = r'Zhou'
+fold = 1  # 训练集k-fold, 可设置1, 2, 3, 4, 5
+depth = 5  # unet编码器的卷积层数
+loss_name = 'bce'  # dice, bce, wbce, dual, wdual 多分类用dice
+reduction = ''  # aug
+model_name = '{}_depth={}_fold_{}_{}_{}{}'.format(model_type, depth, fold, loss_name, reduction, model_number)
+
+# 训练日志
+writer = SummaryWriter(os.path.join(root_path, 'log/train', model_name + '_{}fold'.format(fold) + str(int(time.time()))))
+val_writer = SummaryWriter(os.path.join(os.path.join(root_path, 'log/val', model_name) + '_{}fold'.format(fold) + str(int(time.time()))))
+
+# 训练集路径
+# train_path = os.path.join(root_path, 'media/Datasets/bladder/Augdata_5folds', 'train{}'.format(fold), 'npy')
+# train_path = os.path.join(root_path, 'media/Datasets/Bladder/raw_data')
+
+train_path = os.path.join(r'datasets/lits17')
+
+# train_path = os.path.join(r'D:\pythonProject\datasetsfile\LITS17\LiTS')
+
+# val_path = os.path.join(root_path, 'media/Datasets/Bladder/raw_data')
+val_path = os.path.join(r'datasets/lits17')
+
+
+
+def main():
+    # 定义网络
+    # net = Baseline(num_classes=bladder.num_classes, depth=depth).cuda()
+    # net = AttpasppU_Net(n_channels=1, n_classes=2).cuda()
+    # net = ASFNet().cuda()
+    #net = frequencynet().cuda()
+    net = flashUNet().cuda()
+    #net.load_state_dict(torch.load(r"Zhou/checkpoint/FlashUNet_depth=5_fold_1_bce_282374.pth"))
+    # net = MAU_Net(n_channels=1, n_classes=2).cuda()
+    # net = R2U_Net().cuda()
+    # net = U_Net().cuda()
+
+
+    # net = Baseline(num_classes=bladder.num_classes, depth=depth).cuda()
+    # net = AttpU_Net(n_channels=1, n_classes=2).cuda()  #AttpU_Net ResUnetPlusPlus  R2AttU_Net
+    # net = AttpUdeep_Net(n_channels=1, n_classes=2).cuda()
+    # net = ResUnetPlusPlus().cuda()
+
+
+    # 数据预处理
+    center_crop = joint_transforms.CenterCrop(crop_size)
+    input_transform = extended_transforms.NpyToTensor()
+    target_transform = extended_transforms.MaskToTensor()
+
+    # 训练集加载
+    train_set = bladder.Dataset(train_path, 'train', fold, joint_transform=None, center_crop=center_crop,
+                                    transform=input_transform, target_transform=target_transform)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0)
+    # 验证集加载
+    val_set = bladder.Dataset(val_path, 'val', fold,
+                                  joint_transform=None, transform=input_transform, center_crop=center_crop,
+                                  target_transform=target_transform)
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
+
+    # 定义损失函数
+    if loss_name == 'dice':
+        criterion = SoftDiceLoss(bladder.num_classes).cuda()
+    else:
+        criterion = FocalTverskyLoss(bladder.num_classes).cuda()
+        # criterion = WBCELoss(bladder.num_classes).cuda()
+
+    criterion = torch.nn.BCELoss()
+    # 定义早停机制
+    early_stopping = EarlyStopping(early_stop_patience, verbose=True, delta=early_stop__eps,
+                                   path=os.path.join(root_path, 'checkpoint', '{}.pth'.format(model_name)))
+
+    # 定义优化器
+    if optimizer_type == 'adam':
+        optimizer = torch.optim.Adam(net.parameters(), lr=initial_lr, weight_decay=weight_decay)
+    else:
+        optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9)
+
+    # 定义学习率衰减策略
+    if scheduler_type == 'StepLR':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.1)
+    elif scheduler_type == 'ReduceLR':
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    elif scheduler_type == 'poly':
+        scheduler = PolyLR(optimizer, max_iter=n_epoch, power=0.9)
+    else:
+        scheduler = None
+
+    train(train_loader, val_loader, net, criterion, optimizer, scheduler, None, early_stopping, n_epoch, 0)
+
+
+def train(train_loader, val_loader, net, criterion, optimizer, scheduler, warm_scheduler, early_stopping, num_epoches,
+          iters):
+    for epoch in range(1, num_epoches + 1):
+        st = time.time()
+        train_class_dices = np.array([0] * (bladder.num_classes - 1), dtype=np.float64)
+        val_class_dices = np.array([0] * (bladder.num_classes - 1), dtype=np.float64)
+        val_dice_arr = []
+        train_losses = []
+        val_losses = []
+        # 训练模型
+        net.train()
+        for batch, ((input, mask), file_name) in enumerate(train_loader, 1):
+            X = input.cuda()
+            y = mask.cuda()
+            optimizer.zero_grad()
+            output = net(X)
+            # net = nn.DataParallel(net)
+            #edge_seg = torch.sigmoid(edge_seg)
+            output = torch.sigmoid(output)
+            #loss_edge = criterion_edge(edge_seg*output,edge_seg*y)
+            loss = criterion(output, y)
+            loss.backward()
+            optimizer.step()
+            iters =iters+ 1
+            train_losses.append(loss.item())
+
+            class_dice = []
+            # class_hd=[]
+            # class_jac=[]
+            # class_recall=[]
+            # class_pa = []
+            # class_acc = []
+            # class_se =[]
+            # class_sp = []
+            # class_iou = []
+            # class_miou = []
+            for i in range(1, bladder.num_classes):
+                cur_dice = diceCoeffv2(output[:, i:i + 1, :], y[:, i:i + 1, :]).cpu().item()
+                class_dice.append(cur_dice)
+                # hd = HD(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_hd.append(hd)
+                # jac = jac(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_jac.append(jac)
+                # recall = recall(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_recall.append(recall)
+                # pa = pixel_accuracy(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_pa.append(pa)
+                # acc = accuracy(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_acc.append(acc)
+                # se = SE(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_se.append(se)
+                # sp = SP(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_sp.append(sp)
+                # iou = iou(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_iou.append(iou)
+                # miou = miou(output[:, i:i + 1, :], y[:, i:i + 1, :])
+                # class_miou.append(miou)
+            mean_dice = sum(class_dice) / len(class_dice)
+            # mean_hd = sum(class_hd) / len(class_hd)
+            # mean_jac = sum(class_jac) / len(class_jac)
+            # mean_recall = sum(class_recall) / len(class_recall)
+            # mean_pa = sum(class_pa) / len(class_pa)
+            # mean_acc = sum(class_acc) / len(class_acc)
+            # mean_se = sum(class_se) / len(class_se)
+            # mean_sp = sum(class_sp) / len(class_sp)
+            # mean_iou = sum(class_iou) / len(class_iou)
+            # mean_miou = sum(class_miou) / len(class_miou)
+            train_class_dices = train_class_dices+np.array(class_dice)
+
+            # string_print = 'epoch: {} - iters: {} - loss: {:.4} - mean: {:.4} - bladder: {:.4}- tumor: {:.4}  - time: {:.2}' \
+            #     .format(epoch, iters, loss.data.cpu(), mean_dice, class_dice[0], class_dice[1], time.time() - st)
+            string_print = 'epoch: {} - iters: {} - loss: {:.4} - meandice: {:.4} - tumor: {:.4}  - time: {:.2}' \
+                .format(epoch, iters, loss.data.cpu(), mean_dice, class_dice[0], time.time() - st)
+            misc.log(string_print)
+            st = time.time()
+
+        train_loss = np.average(train_losses)
+        train_class_dices = train_class_dices / batch
+        train_mean_dice = train_class_dices.sum() / train_class_dices.size
+
+        writer.add_scalar('main_loss', train_loss, epoch)
+        writer.add_scalar('main_dice', train_mean_dice, epoch)
+
+        # print('epoch {}/{} - train_loss: {:.4} - train_mean_dice: {:.4} - dice_bladder: {:.4} - dice_tumor: {:.4}'.format(
+        #         epoch, num_epoches, train_loss, train_mean_dice, train_class_dices[0], train_class_dices[1]))
+        print(
+            'epoch {}/{} - train_loss: {:.4} - train_mean_dice: {:.4} - dice_tumor: {:.4}'.format(
+                epoch, num_epoches, train_loss, train_mean_dice, train_class_dices[0]))
+
+        # 验证模型
+        net.eval()
+        all_preds = []
+        all_targets = []
+        for val_batch, ((input, mask), file_name) in tqdm(enumerate(val_loader, 1)):
+            val_X = input.cuda()
+            val_y = mask.cuda()
+            pred = net(val_X)
+            #edge_pred,pred = net(val_X)
+            #edge_pred = torch.sigmoid(edge_pred)
+            pred = torch.sigmoid(pred)
+            all_preds.extend(pred.flatten())
+            all_targets.extend(val_y.flatten())
+            val_loss = criterion(pred, val_y)#+0.2*criterion_edge(edge_pred*pred,edge_pred*val_y)
+
+            val_losses.append(val_loss.item())
+            pred = pred.cpu().detach()
+            val_class_dice = []
+            for i in range(1, bladder.num_classes):
+                val_class_dice.append(diceCoeffv2(pred[:, i:i + 1, :], mask[:, i:i + 1, :]))
+
+            val_dice_arr.append(val_class_dice)
+            val_class_dices = val_class_dices+np.array(val_class_dice)
+        # 现在 all_preds 包含了所有扁平化的预测值，all_targets 包含了所有扁平化的实际标签
+        fpr, tpr, thresholds = roc_curve(all_targets, all_preds)
+        roc_auc = auc(fpr, tpr)
+        # 绘制 ROC 曲线
+        plt.figure()
+        lw = 2
+        plt.plot(fpr, tpr, color='darkorange', lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)
+        plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic')
+        plt.legend(loc="lower right")
+        plt.savefig(os.path.join(root_path, 'ROC_curve_epoch_{}.png'.format(epoch)))
+        # 或者您可以使用 tensorboardX 保存图像
+        # val_writer.add_figure('ROC curve', plt.gcf(), global_step=epoch)
+        val_loss = np.average(val_losses)
+
+        val_dice_arr = np.array(val_dice_arr)
+        val_class_dices = val_class_dices / val_batch
+
+        val_mean_dice = val_class_dices.sum() / val_class_dices.size
+
+        val_writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
+        val_writer.add_scalar('main_loss', val_loss, epoch)
+        val_writer.add_scalar('main_dice', val_mean_dice, epoch)
+
+        # print('val_loss: {:.4} - val_mean_dice: {:.4} - bladder: {:.4}- tumor: {:.4}'
+        #     .format(val_loss, val_mean_dice, val_class_dices[0], val_class_dices[1]))
+        if epoch==1:
+            print('val_loss: {:.4} - val_mean_dice: {:.4} - tumor: {:.4}'
+                  .format(val_loss, val_mean_dice, val_class_dices[0]))
+        else:
+            print('val_loss: {:.4} - val_mean_dice: {:.4} - tumor: {:.4} - best score: {:.4}'
+                  .format(val_loss, val_mean_dice, val_class_dices[0], early_stopping.best_score))
+        print('lr: {}'.format(optimizer.param_groups[0]['lr']))
+
+        early_stopping(val_mean_dice, net, epoch)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            # 结束模型训练
+            break
+
+    print('----------------------------------------------------------')
+    print('save epoch {}'.format(early_stopping.save_epoch))
+    print('stoped epoch {}'.format(epoch))
+    print('----------------------------------------------------------')
+
+
+if __name__ == '__main__':
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    main()
+
